@@ -8,34 +8,49 @@ var _ = require('lodash');
 var schedule = require('node-schedule');
 var request = require('request');
 
-
+var dbo;
 var url = _.get(process, ['env', 'DATABASE_URL']);
 
 var webexMessageParams = {
    headers: {
-      'Authorization': 'Bearer ZTYzYTc4MDctZjY5ZC00YzRhLWI5ZTItMjY3ZGE5YWU3MzgwNDU0NmI2YTYtNWZk_PF84_1eb65fdf-9643-417f-9974-ad72cae0e10f'
+      'Authorization': `Bearer ${_.get(process, ['env', 'WEBEX_TOKEN'])}`
 
    },
    url: "https://api.ciscospark.com/v1/messages"
 };
 
+/**
+ * Converts the a quote to a SHA256 hash to prevent duplicate quotes
+ * @param {string} quote 
+ */
 const getId = (quote) => {
    return crypto.createHash('sha256').update(quote, 'utf8').digest('hex');
 }
 
-const getQuote = async () => {
-   const result = await dbo.collection("quotes").aggregate([{'$sample': {'size': 1 }}]).toArray();
-   return result[0].quote;
+/**
+ * Gets a random quote from the database
+ */
+const getQuote = async (search=null) => {
+
+   const result = search ? 
+      await dbo.collection("quotes").aggregate([{ $match: { quote: { $regex: search, $options: 'i' } } }, { $sample: { size: 1 } }]).toArray()
+      : await dbo.collection("quotes").aggregate([{ $sample: { size: 1 } }]).toArray();
+   
+   if (result.length > 0) {
+      return result[0].quote;
+   }
+   throw new Error("No quote");
 }
 
+/**
+ * Ping all the rooms that ZachBot is in
+ */
 const pingRooms = async () => {
    const rooms = await dbo.collection("rooms").find().toArray();
    getQuote().then(quote => {
       if (quote) {
          _.each(rooms, room => {
-            const params = _.cloneDeep(webexMessageParams);
-            _.set(params, 'form', {"text": quote , "roomId": room._id})
-            request.post(params, (err, res) => printError(err, res));
+            messageRoom(quote, room._id);
          });
       } else {
          console.log("Unable to ping rooms");
@@ -43,32 +58,75 @@ const pingRooms = async () => {
    });
 }
 
-const pingRoom = async (roomId) => {
-   getQuote().then(quote => {
+/**
+ * Messages a room
+ * @param {string} text 
+ * @param {string} roomId 
+ */
+const messageRoom = async (text, roomId) => {
+   const params = _.cloneDeep(webexMessageParams);
+   _.set(params, 'form', {text, roomId})
+   request.post(params, (err, res) => printResponseAndError(err, res));
+}
+
+/**
+ * Ping a specific room
+ * @param {string} roomId 
+ */
+const pingRoom = async (roomId, search=null) => {
+   getQuote(search).then(quote => {
       if (quote) {
          const params = _.cloneDeep(webexMessageParams);
          _.set(params, 'form', {"text": quote , "roomId": roomId})
-         request.post(params, (err, res) => printError(err, res));
+         request.post(params, (err, res) => printResponseAndError(err, res));
       } else {
          console.log("Unable to ping rooms");
       }
    });
 }
 
-const pingWeatherBot = async (roomId) => {
-   _.set(params, 'form', {"markdown": "" , "roomId": room._id})
-   request.post(params, (err, res) => printError(err, res));
+/**
+ * Add a quote to the database
+ * @param {string} quote 
+ */
+const addQuote = async (quote) => {
+   const _id = getId(quote);
+   dbo.collection("quotes").insertOne({_id, quote}, (err, res) => printResponseAndError(err, res));
 }
 
-const printError = (err, res) => {
+/**
+ * Verify that the user's ID is in the database
+ * @param {string} _id 
+ */
+const verifyUser = async (_id) => {
+   const user = await dbo.collection("users").find({ _id }).toArray();
+   return !!user[0];
+}
+
+/**
+ * Print an response and error
+ * @param {*} err 
+ * @param {*} res 
+ */
+const printResponseAndError = (err, res) => {
    if (err) {
       console.log(err);
-   } else {
-      console.log(res.body, res.statusCode)
+   } else if (res && res.body) {
+      console.log(_.get(res, 'body'), _.get(res, 'statusCode'));
    }
 }
 
-var dbo;
+/**
+ * Check if a given roomId is in the database
+ * @param {string} roomId 
+ */
+const checkRoom = async (roomId) => {
+   const foundRoom = await dbo.collection("rooms").find({ _id: roomId });
+   if (!foundRoom) {
+      dbo.collection("rooms").insertOne({ _id: roomId }, (err, res) => printResponseAndError(err, res));
+   }
+}
+
 const init = () => {
    schedule.scheduleJob('0 13 * * 1-5', pingRooms);
    app.use(express.json());
@@ -77,7 +135,6 @@ const init = () => {
 
    // initialize DB with quotes from file
    var quotes = JSON.parse(fs.readFileSync('./messages.json'));
-   var rooms = JSON.parse(fs.readFileSync('./rooms.json'));
    _.each(quotes.quotes, quote => {
       _.set(quote, '_id', getId(_.get(quote, 'quote')));
    })
@@ -89,20 +146,7 @@ const init = () => {
          } else {
             dbo = db.db("zachbot");
             
-            dbo.collection("quotes").insertMany(quotes.quotes, (err, res) => {
-               if (err) {
-                  console.log(err);
-               } else {
-                  console.log("Quotes populated");
-               }
-            });
-            dbo.collection("rooms").insertMany(rooms.rooms, (err, res) => {
-               if (err) {
-                  console.log(err);
-               } else {
-                  console.log("Rooms populated");
-               }
-            });
+            dbo.collection("quotes").insertMany(quotes.quotes, (err, res) => printResponseAndError(err, res));
             var server = app.listen(8081, () => {
                var host = server.address().address;
                var port = server.address().port;
@@ -125,14 +169,9 @@ app.post('/quote', async (req, res) => {
 	   res.status(400).end();
    }
 
-   const _id = getId(quote);
-   dbo.collection("quotes").insertOne({_id, quote}, (err, res) => {
-      if (err) {
-         console.log(error);
-      } else {
-         console.log("1 quote inserted");
-      }
-   });
+   checkRoom(roomId);
+
+   addQuote(quote);
    res.status(200).end();
 });
 
@@ -153,7 +192,63 @@ app.get('/ping', (req, res) => {
 });
 
 app.post('/ping', (req, res) => {
-   const { roomId } = req.body.data;
+   const { roomId } = _.get(req, ["body", "data"]);
+
+   if (!roomId) {
+	   res.status(400).end();
+   }
+   
+   checkRoom(roomId);
+
    pingRoom(roomId);
    res.status(200).end();
+});
+
+app.post('/webex', (req, res) => {
+   console.log("Received POST request from Webex");
+   const messageId = _.get(req, ["body", "data", "id"]);
+   const roomId = _.get(req, ["body", "data", "roomId"]);
+   const personId = _.get(req, ["body", "data", "personId"]);
+   if (messageId && roomId) {
+      // retrieve message from Webex 
+      const params = _.cloneDeep(webexMessageParams);
+      params.url += `/${messageId}`;
+      request.get(params, (err, webexRes) => {
+         printResponseAndError(err);
+         const message = _.get(JSON.parse(webexRes.body), 'text');
+         if (message) {
+            const splitMessage = message.split(" ");
+            if (_.size(splitMessage) === 1 && roomId) {
+               checkRoom(roomId);
+               pingRoom(roomId);
+            }
+            else if (_.size(splitMessage) >= 2) {
+               const command = splitMessage[1];
+               const quote = _.join(_.slice(splitMessage, 2), ' ');
+               switch (command) {
+                  case "add":
+                     verifyUser(personId).then((valid) => {
+                        if (valid) {
+                           console.log("Adding quote");
+                           addQuote(quote);
+                        } else {
+                           console.log("Invalid user");
+                           messageRoom("You are NOT allowed to tell me what to say OwO.", roomId)
+                        }
+                     })
+                     break;
+                  case "get":
+                     pingRoom(roomId, quote);
+                     break;
+                  default:
+                     break;
+               }
+            }
+         }
+         res.status(200).end();
+      });
+
+   } else {
+      res.status(400).end();
+   }
 });
