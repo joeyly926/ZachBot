@@ -1,0 +1,36 @@
+version: '3.3'
+services:
+  web:
+    build:
+      context: ./bot
+      dockerfile: ./Dockerfile
+    network_mode: "bridge"
+    links:
+      - "db:db"
+    depends_on:
+      - db
+    restart: on-failure
+    volumes:
+      - ./bot/:/bot/
+    ports:
+      - "8081:8081"
+    environment:
+      DATABASE_URL: "mongodb://root:root@db:27017"
+    command: node server.js
+  db:
+    build:
+      context: ./db
+      dockerfile: ./Dockerfile
+    network_mode: "bridge"
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: quotes
+    volumes:
+      - ./db/data:/data/db
+      - ./db/init/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+      - ./db/home:/home/mongodb # Docker image needs a home directory to prevent this issue https://github.com/docker-library/mongo/issues/323
+
+volumes:
+  db-data:
+  mongo-config:
