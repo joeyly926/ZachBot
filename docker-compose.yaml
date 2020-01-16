@@ -17,6 +17,7 @@ services:
     environment:
       DATABASE_URL: "mongodb://root:root@db:27017"
       WEBEX_TOKEN: ${WEBEX_TOKEN}
+      WEBEX_SECRET: ${WEBEX_SECRET}
     command: node server.js
   db:
     build:

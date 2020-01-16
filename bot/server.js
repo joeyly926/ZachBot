@@ -1,23 +1,35 @@
-var express = require('express');
-var mongodb = require('mongodb').MongoClient;
-var app = express();
-var bodyParser = require('body-parser');
+const express = require('express');
+const mongodb = require('mongodb').MongoClient;
+const app = express();
+const bodyParser = require('body-parser');
 const crypto = require('crypto');
-var fs = require('fs');
-var _ = require('lodash');
-var schedule = require('node-schedule');
-var request = require('request');
+const fs = require('fs');
+const _ = require('lodash');
+const schedule = require('node-schedule');
+const request = require('request');
 
-var dbo;
-var url = _.get(process, ['env', 'DATABASE_URL']);
+const url = _.get(process, ['env', 'DATABASE_URL']);
 
-var webexMessageParams = {
+const webexSecret =  _.get(process, ['env', 'WEBEX_SECRET']);
+
+const webexMessageParams = {
    headers: {
       'Authorization': `Bearer ${_.get(process, ['env', 'WEBEX_TOKEN'])}`
 
    },
    url: "https://api.ciscospark.com/v1/messages"
 };
+var dbo;
+
+/**
+ * Validate a digital signature from Webex
+ * @param {string} key secret
+ * @param {string} sig dig sig from Webex
+ * @param {string} raw JSON payload 
+ */
+const validateSignature = (key, sig, raw) => {
+   return sig === crypto.createHmac('sha1', key) .update(raw).digest('hex');
+}
 
 /**
  * Converts the a quote to a SHA256 hash to prevent duplicate quotes
@@ -121,9 +133,13 @@ const printResponseAndError = (err, res) => {
  * @param {string} roomId 
  */
 const checkRoom = async (roomId) => {
-   const foundRoom = await dbo.collection("rooms").find({ _id: roomId });
-   if (!foundRoom) {
+   console.log("Checking if room is in DB...");
+   const foundRoom = await dbo.collection("rooms").find({ _id: roomId }).toArray();
+   if (!_.size(foundRoom)) {
+      console.log("Room not in DB. Adding...");
       dbo.collection("rooms").insertOne({ _id: roomId }, (err, res) => printResponseAndError(err, res));
+   } else {
+      console.log("Found room.");
    }
 }
 
@@ -209,35 +225,43 @@ app.post('/webex', (req, res) => {
    const messageId = _.get(req, ["body", "data", "id"]);
    const roomId = _.get(req, ["body", "data", "roomId"]);
    const personId = _.get(req, ["body", "data", "personId"]);
-   if (messageId && roomId) {
+   const signature = req.get('X-Spark-Signature');
+   if (!validateSignature(webexSecret, signature, JSON.stringify(_.get(req, "body")))) {
+      console.log("Sender is not authorized.");
+      res.status(400).end();
+   } else if (messageId && roomId) {
       // retrieve message from Webex 
       const params = _.cloneDeep(webexMessageParams);
       params.url += `/${messageId}`;
+      console.log("Sender is authorized.");
       request.get(params, (err, webexRes) => {
          printResponseAndError(err);
          const message = _.get(JSON.parse(webexRes.body), 'text');
+         console.log(message)
          if (message) {
             const splitMessage = message.split(" ");
             if (_.size(splitMessage) === 1 && roomId) {
                checkRoom(roomId);
+               console.log("Sending quote to room: ", roomId);
                pingRoom(roomId);
             }
             else if (_.size(splitMessage) >= 2) {
                const command = splitMessage[1];
                const quote = _.join(_.slice(splitMessage, 2), ' ');
                switch (command) {
-                  case "add":
+                  case ".add":
                      verifyUser(personId).then((valid) => {
                         if (valid) {
                            console.log("Adding quote");
+                           messageRoom("I allow it.", roomId);
                            addQuote(quote);
                         } else {
                            console.log("Invalid user");
-                           messageRoom("You are NOT allowed to tell me what to say OwO.", roomId)
+                           messageRoom("You are NOT allowed to tell me what to say OwO.", roomId);
                         }
                      })
                      break;
-                  case "get":
+                  case ".get":
                      pingRoom(roomId, quote);
                      break;
                   default:
