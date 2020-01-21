@@ -1,6 +1,7 @@
 version: '3.3'
 services:
   web:
+    # image: zachbot_web:482334094865.dkr.ecr.us-east-2.amazonaws.com/zachbot_web
     build:
       context: ./bot
       dockerfile: ./Dockerfile

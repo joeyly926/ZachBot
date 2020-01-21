@@ -21,6 +21,8 @@ const webexMessageParams = {
 };
 var dbo;
 
+// TODO: modularize for other *Bots.
+
 /**
  * Validate a digital signature from Webex
  * @param {string} key secret
@@ -112,9 +114,10 @@ const addQuote = async (quote) => {
  */
 const verifyUser = async (_id) => {
    const user = await dbo.collection("users").find({ _id }).toArray();
-   return !!user[0];
+   return !!_.head(user);
 }
 
+// TODO: be more specific with location of logs and formatting
 /**
  * Print an response and error
  * @param {*} err 
@@ -134,12 +137,44 @@ const printResponseAndError = (err, res) => {
  */
 const checkRoom = async (roomId) => {
    console.log("Checking if room is in DB...");
-   const foundRoom = await dbo.collection("rooms").find({ _id: roomId }).toArray();
-   if (!_.size(foundRoom)) {
-      console.log("Room not in DB. Adding...");
-      dbo.collection("rooms").insertOne({ _id: roomId }, (err, res) => printResponseAndError(err, res));
+   const foundRoom = await findRoom(roomId);
+   if (!foundRoom || foundRoom.daily === null) {
+      console.log("Adding or updating room.");
+      dbo.collection("rooms").insertOne({ _id: roomId, daily: true }, (err, res) => printResponseAndError(err, res));
    } else {
       console.log("Found room.");
+   }
+}
+
+/**
+ * Toggles the daily quotes for a room
+ * @param {string} roomId 
+ */
+const toggleDaily = async (roomId, daily) => {
+   console.log("Checking if room is in DB...");
+   const foundRoom = await findRoom(roomId);
+   const set = daily || !_.get(foundRoom, 'daily') || false;
+   if (foundRoom) {
+      console.log(`Setting daily to ${set}`);
+      dbo.collection("rooms").update({ _id: roomId }, { _id: roomId, daily: set}, {upsert: true});
+   } else {
+      console.log("No room was found to toggle daily.");
+   }
+
+   return set;
+}
+
+/**
+ * Finds a room given an ID
+ * @param {string} _id id of room
+ */
+const findRoom = async (_id) => {
+   try {
+      // db query should only find 1 room. If there's more than 1 room, good luck ;)
+      const room = await dbo.collection("rooms").find({ _id }).toArray();
+      return _.head(room);
+   } catch {
+      return null;
    }
 }
 
@@ -161,8 +196,16 @@ const init = () => {
             setTimeout(init, 5000);
          } else {
             dbo = db.db("zachbot");
-            
-            dbo.collection("quotes").insertMany(quotes.quotes, (err, res) => printResponseAndError(err, res));
+            var bulkUpdate = _.map(quotes.quotes, quote => {
+               return  {
+                  updateOne: {
+                     filter: { _id: quote._id },
+                     update: { $set: { quote: quote.quote } },
+                     upsert: true
+                  }
+               };
+            });
+            dbo.collection("quotes").bulkWrite(bulkUpdate);
             var server = app.listen(8081, () => {
                var host = server.address().address;
                var port = server.address().port;
@@ -237,7 +280,6 @@ app.post('/webex', (req, res) => {
       request.get(params, (err, webexRes) => {
          printResponseAndError(err);
          const message = _.get(JSON.parse(webexRes.body), 'text');
-         console.log(message)
          if (message) {
             const splitMessage = message.split(" ");
             if (_.size(splitMessage) === 1 && roomId) {
@@ -263,6 +305,27 @@ app.post('/webex', (req, res) => {
                      break;
                   case ".get":
                      pingRoom(roomId, quote);
+                     break;
+                  case ".daily":
+                     toggleDaily(roomId).then((set) => {
+                        const response = set ? 'Yessssss' : 'Wow, you gonna do me like that?';
+                        messageRoom(response, roomId);
+                     });
+                     break;
+                  case ".help":
+                     const commands  = {
+                        '.add': 'As an authorized user, add a quote.',
+                        '.get': 'Search for a quote!',
+                        '.daily': 'Turn my daily quotes on or off!',
+                        '.help': 'Get some help!'
+                     }
+                     messageRoom( 
+                        _.join(
+                           _.map(
+                              commands, (description, command) => `\`${command}\`: ${description}`
+                           ),
+                           '\n')
+                        , roomId);
                      break;
                   default:
                      break;
