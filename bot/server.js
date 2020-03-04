@@ -13,15 +13,43 @@ const url = _.get(process, ['env', 'DATABASE_URL']);
 const webexSecret =  _.get(process, ['env', 'WEBEX_SECRET']);
 
 const webexMessageParams = {
-   headers: {
-      'Authorization': `Bearer ${_.get(process, ['env', 'WEBEX_TOKEN'])}`
-
-   },
    url: "https://api.ciscospark.com/v1/messages"
 };
+
+const replaceChars = {
+   '’': '\'',
+   '“': '\"',
+}
 var dbo;
 
-// TODO: modularize for other *Bots.
+const getWebexMessageParams = (token) => {
+   const params = _.cloneDeep(webexMessageParams);
+   return _.set(params, 'headers', { 'Authorization': `Bearer ${token}` });
+}
+
+const getBot = async (createdBy) => {
+   const bot = await dbo.collection("bots").find({ createdBy }).toArray();
+   
+   return bot[0];
+}
+
+const getBots = async () => {
+   const bots = await dbo.collection("bots").find({}).toArray();
+   
+   return bots;
+}
+
+const getWebexSecret = async (createdBy) => {
+   const secret = await dbo.collection("bots").find({ createdBy }).toArray()[0].webexSecret;
+   
+   return secret;
+}
+
+const getWebexToken = async (createdBy) => {
+   const token = await dbo.collection("bots").find({ createdBy }).toArray()[0].webexToken;
+   
+   return token;
+}
 
 /**
  * Validate a digital signature from Webex
@@ -44,12 +72,10 @@ const getId = (quote) => {
 /**
  * Gets a random quote from the database
  */
-const getQuote = async (search=null) => {
+const getQuote = async (createdBy, search='') => {
+   const result = await dbo.collection("quotes")
+      .aggregate([{ $match: { bots: _.set({ }, createdBy, true), quote:{ $regex: search, $options: 'i' } } }, { $sample: { size: 1 } }]).toArray();
 
-   const result = search ? 
-      await dbo.collection("quotes").aggregate([{ $match: { quote: { $regex: search, $options: 'i' } } }, { $sample: { size: 1 } }]).toArray()
-      : await dbo.collection("quotes").aggregate([{ $sample: { size: 1 } }]).toArray();
-   
    if (result.length > 0) {
       return result[0].quote;
    }
@@ -57,19 +83,36 @@ const getQuote = async (search=null) => {
 }
 
 /**
- * Ping all the rooms that ZachBot is in
+ * Ping all the rooms that a bot is in
  */
-const pingRooms = async () => {
-   const rooms = await dbo.collection("rooms").find().toArray();
-   getQuote().then(quote => {
-      if (quote) {
-         _.each(rooms, room => {
-            messageRoom(quote, room._id);
-         });
-      } else {
-         console.log("Unable to ping rooms");
+const pingRooms = async (bot, daily=false) => {
+   let id;
+   let token;
+   if (typeof bot === 'string') {
+      const foundBot = await dbo.collection("bots").find({ _id: bot }).toArray()[0];
+      if (foundBot) {
+         id = foundBot.createdBy;
+         token = foundBot.token;
       }
-   });
+   } else if (bot instanceof Object){
+      id = bot.createdBy;
+      token = bot.token;
+   } 
+
+   if (id && token) {
+      getQuote(id).then(async quote => {
+         if (quote) {
+            const params = await getWebexMessageParams(token);
+            _.each(bot.rooms, (room, roomId) => {
+               if (!daily || daily && _.get(room, 'daily')) {
+                  messageRoom(params, quote, roomId);
+               }
+            });
+         } else {
+            console.log("Unable to ping rooms");
+         }
+      });
+   }
 }
 
 /**
@@ -77,9 +120,8 @@ const pingRooms = async () => {
  * @param {string} text 
  * @param {string} roomId 
  */
-const messageRoom = async (text, roomId) => {
-   const params = _.cloneDeep(webexMessageParams);
-   _.set(params, 'form', {text, roomId})
+const messageRoom = async (params, text, roomId) => {
+   _.set(params, 'form', { text, roomId })
    request.post(params, (err, res) => printResponseAndError(err, res));
 }
 
@@ -87,12 +129,11 @@ const messageRoom = async (text, roomId) => {
  * Ping a specific room
  * @param {string} roomId 
  */
-const pingRoom = async (roomId, search=null) => {
-   getQuote(search).then(quote => {
+const pingRoom = async (params, roomId, createdBy, search='') => {
+   getQuote(createdBy, search).then(quote => {
+      console.log("Quote found: " + quote);
       if (quote) {
-         const params = _.cloneDeep(webexMessageParams);
-         _.set(params, 'form', {"text": quote , "roomId": roomId})
-         request.post(params, (err, res) => printResponseAndError(err, res));
+         messageRoom(params, quote, roomId)
       } else {
          console.log("Unable to ping rooms");
       }
@@ -103,17 +144,22 @@ const pingRoom = async (roomId, search=null) => {
  * Add a quote to the database
  * @param {string} quote 
  */
-const addQuote = async (quote) => {
-   const _id = getId(quote);
-   dbo.collection("quotes").insertOne({_id, quote}, (err, res) => printResponseAndError(err, res));
+const addQuote = async (quote, createdBy) => {
+   const sanitizedQuote = _.replace(quote, new RegExp(_.join(_.keys(replaceChars), '|'), 'gi'), c => replaceChars[c]);
+   const _id = getId(sanitizedQuote);
+   const obj = { };
+   obj['bots.' + createdBy] = true;
+   dbo.collection("quotes").updateOne({ _id }, { $set: { _id, quote: sanitizedQuote, ...obj} }, { upsert: true }, (err, res) => printResponseAndError(err, res));
 }
 
 /**
  * Verify that the user's ID is in the database
  * @param {string} _id 
  */
-const verifyUser = async (_id) => {
-   const user = await dbo.collection("users").find({ _id }).toArray();
+const verifyUser = async (_id, createdBy) => {
+   const obj = { };
+   obj['bots.' + createdBy] = { $exists: true }
+   const user = await dbo.collection("users").find({ _id, ...obj}).toArray();
    return !!_.head(user);
 }
 
@@ -133,14 +179,14 @@ const printResponseAndError = (err, res) => {
 
 /**
  * Check if a given roomId is in the database
- * @param {string} roomId 
+ * @param {string} roomId
  */
-const checkRoom = async (roomId) => {
+const checkRoom = async (roomId, bot) => {
    console.log("Checking if room is in DB...");
-   const foundRoom = await findRoom(roomId);
-   if (!foundRoom || foundRoom.daily === null) {
+   const room = _.get(bot, ['rooms', roomId]);
+   if (!room || !room.daily) {
       console.log("Adding or updating room.");
-      dbo.collection("rooms").insertOne({ _id: roomId, daily: true }, (err, res) => printResponseAndError(err, res));
+      dbo.collection("bots").update({ createdBy: bot.createdBy }, { $set: { rooms:  _.set({ }, roomId, { daily: true }) } }, {upsert: true});
    } else {
       console.log("Found room.");
    }
@@ -150,13 +196,13 @@ const checkRoom = async (roomId) => {
  * Toggles the daily quotes for a room
  * @param {string} roomId 
  */
-const toggleDaily = async (roomId, daily) => {
+const toggleDaily = async (roomId, bot, daily) => {
    console.log("Checking if room is in DB...");
-   const foundRoom = await findRoom(roomId);
-   const set = daily || !_.get(foundRoom, 'daily') || false;
+   const foundRoom = _.get(bot, ['rooms', roomId]);
+   const set = daily || ('daily' in foundRoom ? !foundRoom.daily : true);
    if (foundRoom) {
       console.log(`Setting daily to ${set}`);
-      dbo.collection("rooms").update({ _id: roomId }, { _id: roomId, daily: set}, {upsert: true});
+      dbo.collection("bots").update({ createdBy: bot.createdBy }, { $set: { rooms:  _.set({ }, roomId, { daily: set }) } }, {upsert: true});
    } else {
       console.log("No room was found to toggle daily.");
    }
@@ -164,22 +210,8 @@ const toggleDaily = async (roomId, daily) => {
    return set;
 }
 
-/**
- * Finds a room given an ID
- * @param {string} _id id of room
- */
-const findRoom = async (_id) => {
-   try {
-      // db query should only find 1 room. If there's more than 1 room, good luck ;)
-      const room = await dbo.collection("rooms").find({ _id }).toArray();
-      return _.head(room);
-   } catch {
-      return null;
-   }
-}
-
 const init = () => {
-   schedule.scheduleJob('0 13 * * 1-5', pingRooms);
+   schedule.scheduleJob('0 13 * * 1-5', async () => getBots().then(bots => _.each(bots, bot => pingRooms(bot, true))));
    app.use(express.json());
    app.use(bodyParser.json()); // support json encoded bodies
    app.use(bodyParser.urlencoded({ extended: true })); // support encoded bodies
@@ -200,7 +232,7 @@ const init = () => {
                return  {
                   updateOne: {
                      filter: { _id: quote._id },
-                     update: { $set: { quote: quote.quote } },
+                     update: { $set: { quote: quote.quote, bots: _.set({ }, _.get(quote, 'createdBy', undefined), true) } },
                      upsert: true
                   }
                };
@@ -222,94 +254,100 @@ init();
 
 /* APIs */
 
-app.post('/quote', async (req, res) => {
-   const quote = _.get(req, ['body', 'quote']);
-   if (!quote) {
-	   res.status(400).end();
-   }
+// app.post('/quote', async (req, res) => {
+//    const quote = _.get(req, ['body', 'quote']);
+//    if (!quote) {
+// 	   res.status(400).end();
+//    }
 
-   checkRoom(roomId);
+//    checkRoom(roomId);
 
-   addQuote(quote);
-   res.status(200).end();
-});
+//    addQuote(quote);
+//    res.status(200).end();
+// });
 
-app.get('/quote', async (_req, res) => {
-   getQuote().then(quote => {
-      if (!quote) {
-         res.status(500).send("Unable to get quote").end();
-      } else {
-         res.status(200).send(quote).end();
-      }
-   });
+// app.get('/quote', async (_req, res) => {
+//    getQuote().then(quote => {
+//       if (!quote) {
+//          res.status(500).send("Unable to get quote").end();
+//       } else {
+//          res.status(200).send(quote).end();
+//       }
+//    });
    
-})
+// })
 
-app.get('/ping', (req, res) => {
-   pingRooms();
-   res.status(200).end();
-});
+// app.get('/ping', (req, res) => {
+//    pingRooms();
+//    res.status(200).end();
+// });
 
-app.post('/ping', (req, res) => {
-   const { roomId } = _.get(req, ["body", "data"]);
+// app.post('/ping', (req, res) => {
+//    const { roomId } = _.get(req, ["body", "data"]);
 
-   if (!roomId) {
-	   res.status(400).end();
-   }
+//    if (!roomId) {
+// 	   res.status(400).end();
+//    }
    
-   checkRoom(roomId);
+//    checkRoom(roomId);
 
-   pingRoom(roomId);
-   res.status(200).end();
-});
+//    pingRoom(roomId);
+//    res.status(200).end();
+// });
 
-app.post('/webex', (req, res) => {
+app.post('/webex', async (req, res) => {
    console.log("Received POST request from Webex");
-   const messageId = _.get(req, ["body", "data", "id"]);
-   const roomId = _.get(req, ["body", "data", "roomId"]);
-   const personId = _.get(req, ["body", "data", "personId"]);
+   const { createdBy, data } = _.get(req, 'body', { });
+   const { roomId, personId } = data;
+   const messageId = _.get(data, 'id');
    const signature = req.get('X-Spark-Signature');
    if (!validateSignature(webexSecret, signature, JSON.stringify(_.get(req, "body")))) {
       console.log("Sender is not authorized.");
       res.status(400).end();
    } else if (messageId && roomId) {
-      // retrieve message from Webex 
-      const params = _.cloneDeep(webexMessageParams);
-      params.url += `/${messageId}`;
+      // retrieve message from Webex
+      const bot = await getBot(createdBy);
+      const params = getWebexMessageParams(bot.token);
+      const msgParams = _.cloneDeep(params);
+      msgParams.url += `/${messageId}`;
       console.log("Sender is authorized.");
-      request.get(params, (err, webexRes) => {
-         printResponseAndError(err);
+      request.get(msgParams, async (err, webexRes) => {
+         printResponseAndError(err, webexRes);
          const message = _.get(JSON.parse(webexRes.body), 'text');
          if (message) {
+            console.log("Received message: ", message);
             const splitMessage = message.split(" ");
             if (_.size(splitMessage) === 1 && roomId) {
-               checkRoom(roomId);
+               checkRoom(roomId, bot);
                console.log("Sending quote to room: ", roomId);
-               pingRoom(roomId);
+               pingRoom(params, roomId, createdBy);
             }
             else if (_.size(splitMessage) >= 2) {
                const command = splitMessage[1];
                const quote = _.join(_.slice(splitMessage, 2), ' ');
                switch (command) {
                   case ".add":
-                     verifyUser(personId).then((valid) => {
-                        if (valid) {
-                           console.log("Adding quote");
-                           messageRoom("I allow it.", roomId);
-                           addQuote(quote);
-                        } else {
-                           console.log("Invalid user");
-                           messageRoom("You are NOT allowed to tell me what to say OwO.", roomId);
-                        }
-                     })
+                     let authorized = true;
+                     if (_.get(bot, 'auth', true)) {
+                        authorized = await verifyUser(personId, createdBy);
+                     }
+                     if (authorized) {
+                        console.log("Adding quote");
+                        // TODO: add messages for different bots instead of just ZachBot
+                        messageRoom(params, "I allow it.", roomId);
+                        addQuote(quote, createdBy);
+                     } else {
+                        console.log("Invalid user");
+                        messageRoom(params, "You are NOT allowed to tell me what to say OwO.", roomId);
+                     }
                      break;
                   case ".get":
-                     pingRoom(roomId, quote);
+                     pingRoom(params, roomId, createdBy, quote);
                      break;
                   case ".daily":
-                     toggleDaily(roomId).then((set) => {
+                     toggleDaily(roomId, bot).then((set) => {
                         const response = set ? 'Yessssss' : 'Wow, you gonna do me like that?';
-                        messageRoom(response, roomId);
+                        messageRoom(params, response, roomId);
                      });
                      break;
                   case ".help":
@@ -319,7 +357,8 @@ app.post('/webex', (req, res) => {
                         '.daily': 'Turn my daily quotes on or off!',
                         '.help': 'Get some help!'
                      }
-                     messageRoom( 
+                     messageRoom(
+                        params,
                         _.join(
                            _.map(
                               commands, (description, command) => `\`${command}\`: ${description}`
@@ -336,6 +375,7 @@ app.post('/webex', (req, res) => {
       });
 
    } else {
+      console.log("SoMethiNg BrOkE");
       res.status(400).end();
    }
 });
